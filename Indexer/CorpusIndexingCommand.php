@@ -2,6 +2,7 @@
 
 namespace Markup\NeedleBundle\Indexer;
 
+use AlgoliaSearch\Client as AlgoliaClient;
 use Markup\NeedleBundle\Corpus\CorpusInterface;
 use Markup\NeedleBundle\Corpus\CorpusProvider;
 use Markup\NeedleBundle\Event\CorpusPostUpdateEvent;
@@ -103,18 +104,6 @@ class CorpusIndexingCommand
      **/
     private $deleteQuery;
 
-    /**
-     * @param CorpusProvider            $corpusProvider
-     * @param Solarium                  $solarium
-     * @param SubjectDataMapperProvider $subjectMapperProvider
-     * @param FilterQueryLucenifier     $filterQueryLucenifier
-     * @param EventDispatcherInterface  $eventDispatcher
-     * @param IndexCallbackProvider     $indexCallbackProvider
-     * @param bool                      $shouldPreDelete
-     * @param LoggerInterface           $logger
-     * @param AppendIterator            $wrappingIterator
-     * @param bool                      $shouldAllowNullFieldValues
-     **/
     public function __construct(
         CorpusProvider $corpusProvider,
         Solarium $solarium,
@@ -122,10 +111,10 @@ class CorpusIndexingCommand
         FilterQueryLucenifier $filterQueryLucenifier,
         EventDispatcherInterface $eventDispatcher,
         IndexCallbackProvider $indexCallbackProvider,
-        $shouldPreDelete = false,
+        bool $shouldPreDelete = false,
         LoggerInterface $logger = null,
         AppendIterator $wrappingIterator = null,
-        $shouldAllowNullFieldValues = true
+        bool $shouldAllowNullFieldValues = true
     ) {
         $this->corpusProvider = $corpusProvider;
         $this->solarium = $solarium;
@@ -145,38 +134,70 @@ class CorpusIndexingCommand
         if (empty($this->corpusName)) {
             throw new \BadMethodCallException('You need to set a corpus name on the corpus indexing command in order to execute it.');
         }
-        $isFullUpdate = $this->shouldPreDelete;
-        $this->eventDispatcher->dispatch(SearchEvents::CORPUS_PRE_UPDATE, new CorpusPreUpdateEvent($this->getCorpus(), $isFullUpdate));
-        $logger = $this->getLogger();
-        $logger->info(sprintf('Indexing of corpus "%s" started.', $this->getCorpus()->getName()));
-        $logger->debug(sprintf('Memory usage before search indexing process: %01.0fMB.', (memory_get_usage(true) / 1024) / 1024));
-        $startTime = microtime(true);
-        $wrappingIterator = $this->getWrappingIterator();
-        if (!$this->iteratorAppended) {
-            $wrappingIterator->append($this->getSubjectIteration());
-            $this->iteratorAppended = true;
+        $backend = 'algolia';
+        if ($backend === 'solarium') {
+            $isFullUpdate = $this->shouldPreDelete;
+            $this->eventDispatcher->dispatch(SearchEvents::CORPUS_PRE_UPDATE, new CorpusPreUpdateEvent($this->getCorpus(), $isFullUpdate));
+            $logger = $this->getLogger();
+            $logger->info(sprintf('Indexing of corpus "%s" started.', $this->getCorpus()->getName()));
+            $logger->debug(sprintf('Memory usage before search indexing process: %01.0fMB.', (memory_get_usage(true) / 1024) / 1024));
+            $startTime = microtime(true);
+            $wrappingIterator = $this->getWrappingIterator();
+            if (!$this->iteratorAppended) {
+                $wrappingIterator->append($this->getSubjectIteration());
+                $this->iteratorAppended = true;
+            }
+            $subjects = $wrappingIterator;
+            $updateQuery = $this->getSolariumClient()->createUpdate();
+            //initially delete all indexes - todo allow disambiguation between types of document
+            if ($this->shouldPreDelete) {
+                $updateQuery->addDeleteQuery($this->getDeleteQueryLucene());
+            }
+            $documentGenerator = new SubjectDocumentGenerator($this->getSubjectMapper(), $this->shouldAllowNullFieldValues);
+            $documentGenerator->setUpdateQuery($updateQuery);
+            $updateQuery->addDocuments(
+                new DocumentFilterIterator(
+                    new SubjectDocumentIterator($subjects, $documentGenerator, $this->indexCallbackProvider->getCallbacksForCorpus($this->getCorpus()))
+                )
+            );
+            $updateQuery->addCommit();
+            $updateQuery->addOptimize();
+            $result = $this->getSolariumClient()->update($updateQuery);
+            $logger->debug(sprintf('Status code of Solr query: %s. Query time: %ums.', $result->getStatus(), $result->getQueryTime()));
+            $logger->debug(sprintf('Memory usage after search indexing process: %01.0fMB.', (memory_get_usage(true) / 1024) / 1024));
+            $endTime = microtime(true);
+            $logger->info(sprintf('Indexing of corpus "%s" completed successfully in %01.3fs.', $this->getCorpus()->getName(), $endTime-$startTime));
+            $this->eventDispatcher->dispatch(SearchEvents::CORPUS_POST_UPDATE, new CorpusPostUpdateEvent($this->getCorpus(), $isFullUpdate, new SolariumUpdateResult($result)));
+        } elseif ($backend === 'algolia') {
+            $isFullUpdate = $this->shouldPreDelete;
+            $this->eventDispatcher->dispatch(SearchEvents::CORPUS_PRE_UPDATE, new CorpusPreUpdateEvent($this->getCorpus(), $isFullUpdate));
+            $logger = $this->getLogger();
+            $logger->info(sprintf('Indexing of corpus "%s" started.', $this->getCorpus()->getName()));
+            $logger->debug(sprintf('Memory usage before search indexing process: %01.0fMB.', (memory_get_usage(true) / 1024) / 1024));
+            $startTime = microtime(true);
+            $wrappingIterator = $this->getWrappingIterator();
+            if (!$this->iteratorAppended) {
+                $wrappingIterator->append($this->getSubjectIteration());
+                $this->iteratorAppended = true;
+            }
+            $subjects = $wrappingIterator;
+            $algolia = new AlgoliaClient('app_id', 'api_key');
+            $objects = [];
+            $hashGenerator = new SubjectHashGenerator($this->getSubjectMapper());
+            foreach ($subjects as $subject) {
+                $object = $hashGenerator->createHashForSubject($subject);
+                if (null === $object) {
+                    continue;
+                }
+                $objects[] = $object;
+            }
+            $index = $algolia->initIndex('index_name');
+            $index->addObjects($objects);
+            $logger->debug(sprintf('Memory usage after search indexing process: %01.0fMB.', (memory_get_usage(true) / 1024) / 1024));
+            $endTime = microtime(true);
+            $logger->info(sprintf('Indexing of corpus "%s" out to Algolia completed successfully in %01.3fs.', $this->getCorpus()->getName(), $endTime-$startTime));
+//            $this->eventDispatcher->dispatch(SearchEvents::CORPUS_POST_UPDATE, new CorpusPostUpdateEvent($this->getCorpus(), $isFullUpdate, new SolariumUpdateResult($result)));
         }
-        $subjects = $wrappingIterator;
-        $updateQuery = $this->getSolariumClient()->createUpdate();
-        //initially delete all indexes - todo allow disambiguation between types of document
-        if ($this->shouldPreDelete) {
-            $updateQuery->addDeleteQuery($this->getDeleteQueryLucene());
-        }
-        $documentGenerator = new SubjectDocumentGenerator($this->getSubjectMapper(), $this->shouldAllowNullFieldValues);
-        $documentGenerator->setUpdateQuery($updateQuery);
-        $updateQuery->addDocuments(
-            new DocumentFilterIterator(
-                new SubjectDocumentIterator($subjects, $documentGenerator, $this->indexCallbackProvider->getCallbacksForCorpus($this->getCorpus()))
-            )
-        );
-        $updateQuery->addCommit();
-        $updateQuery->addOptimize();
-        $result = $this->getSolariumClient()->update($updateQuery);
-        $logger->debug(sprintf('Status code of Solr query: %s. Query time: %ums.', $result->getStatus(), $result->getQueryTime()));
-        $logger->debug(sprintf('Memory usage after search indexing process: %01.0fMB.', (memory_get_usage(true) / 1024) / 1024));
-        $endTime = microtime(true);
-        $logger->info(sprintf('Indexing of corpus "%s" completed successfully in %01.3fs.', $this->getCorpus()->getName(), $endTime-$startTime));
-        $this->eventDispatcher->dispatch(SearchEvents::CORPUS_POST_UPDATE, new CorpusPostUpdateEvent($this->getCorpus(), $isFullUpdate, new SolariumUpdateResult($result)));
     }
 
     /**

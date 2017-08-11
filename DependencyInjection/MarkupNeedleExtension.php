@@ -58,7 +58,7 @@ class MarkupNeedleExtension extends Extension
      **/
     public function loadBackend(array $config, ContainerBuilder $container)
     {
-        $knownBackends = ['solarium'];
+        $knownBackends = ['solarium', 'algolia'];
         if (!isset($config['backend']['type'])) {
             return;
         }
